@@ -8,10 +8,14 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
-import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
 import os
+import matplotlib
+# 2D: Safe matplotlib backend selection
+if os.environ.get('DISPLAY') or os.name == 'nt':
+    matplotlib.use('TkAgg')
+else:
+    matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Optional Streamlit dashboard
 try:
@@ -24,12 +28,25 @@ except ImportError:
 # 1. ENVIRONMENT
 # =============================
 class TradingEnv:
-    def __init__(self, prices, window_size=30, transaction_cost=0.001):
+    def __init__(self, prices, window_size=30, transaction_cost=0.001,
+                 regime_labels=None, lstm_vol_preds=None):
         self.prices = np.array(prices)
         self.returns = np.diff(self.prices) / self.prices[:-1]
         self.window_size = window_size
         self.transaction_cost = transaction_cost
         self.action_space = 3  # 0: Hold, 1: Buy, 2: Sell
+
+        # 2B: Optional regime and LSTM volatility signals
+        if regime_labels is not None:
+            self.regime_labels = np.array(regime_labels)
+        else:
+            self.regime_labels = np.zeros(len(self.prices))
+
+        if lstm_vol_preds is not None:
+            self.lstm_vol_preds = np.array(lstm_vol_preds)
+        else:
+            self.lstm_vol_preds = np.zeros(len(self.prices))
+
         self.reset()
 
     def reset(self):
@@ -44,8 +61,11 @@ class TradingEnv:
         return self._get_state()
 
     def _get_state(self):
-        # State: window of returns
-        return self.returns[self.current_step - self.window_size:self.current_step]
+        # State: window of returns + normalized regime signal + vol forecast
+        returns_window = self.returns[self.current_step - self.window_size:self.current_step]
+        regime_signal = (self.regime_labels[self.current_step] - 1.0) / 1.0
+        vol_forecast = self.lstm_vol_preds[self.current_step]
+        return np.append(returns_window, [regime_signal, vol_forecast])
 
     def step(self, action):
         reward = 0
@@ -154,6 +174,8 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+TAU = 0.005  # 2C: Polyak averaging coefficient
+
 class DQNAgent:
     def __init__(self, state_dim, action_dim, lr=1e-3, gamma=0.99, epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.995, buffer_size=10000, batch_size=64):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -203,8 +225,10 @@ class DQNAgent:
         self.optimizer.step()
 
         self.update_steps += 1
-        if self.update_steps % 100 == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
+        # 2C: Soft Polyak averaging every 10 steps
+        if self.update_steps % 10 == 0:
+            for t_param, p_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+                t_param.data.copy_(TAU * p_param.data + (1 - TAU) * t_param.data)
 
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
         return loss.item()
@@ -299,7 +323,7 @@ def main():
         prices = generate_synthetic_prices(length=1500)
 
     env = TradingEnv(prices, window_size=args.window, transaction_cost=args.transaction_cost)
-    agent = DQNAgent(state_dim=args.window, action_dim=3, lr=args.lr)
+    agent = DQNAgent(state_dim=args.window + 2, action_dim=3, lr=args.lr)
 
     rewards, equity_curves, action_counts = train_agent(env, agent, episodes=args.episodes)
 
